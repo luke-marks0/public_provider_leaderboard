@@ -1,0 +1,12 @@
+{
+  "model": "MiniMaxAI/MiniMax-M2.1",
+  "served_model_name": "",
+  "tensor_parallel_size": 4,
+  "dtype": "bfloat16",
+  "gpu_memory_utilization": 0.9,
+  "max_model_len": 32768,
+  "trust_remote_code": true,
+  "modal_gpu": "H100:4",
+  "modal_min_containers": 1,
+  "modal_scaledown_window_seconds": 600
+}

@@ -1,0 +1,12 @@
+{
+  "model": "mistralai/Mistral-Large-3-675B-Instruct-2512",
+  "served_model_name": "",
+  "tensor_parallel_size": 8,
+  "dtype": "auto",
+  "gpu_memory_utilization": 0.75,
+  "max_model_len": 16384,
+  "trust_remote_code": false,
+  "modal_gpu": "H100:8",
+  "modal_min_containers": 1,
+  "modal_scaledown_window_seconds": 600
+}
