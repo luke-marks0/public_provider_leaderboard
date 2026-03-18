@@ -922,7 +922,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-tokens",
         action="store_true",
-        help="Use saved reference token sequences per model from token-difr/reference_tokens.",
+        help="Use saved reference token sequences per model from reference_tokens/.",
     )
     parser.add_argument(
         "--fireworks-verification-model",

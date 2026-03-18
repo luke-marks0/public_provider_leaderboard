@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -37,6 +38,9 @@ DEFAULT_MODAL_GPU = "H100"
 DEFAULT_MODAL_MIN_CONTAINERS = 0
 DEFAULT_MODAL_MAX_CONTAINERS = 1
 DEFAULT_MODAL_SCALEDOWN_WINDOW_SECONDS = 60
+O200K_BASE_TIKTOKEN_URL = "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken"
+O200K_BASE_TIKTOKEN_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+CONFIG_DIR = TOKEN_DIFR_ROOT / "configs"
 
 
 def _utc_now_iso() -> str:
@@ -47,6 +51,91 @@ def _sanitize_name(value: str) -> str:
     slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
     slug = "-".join(part for part in slug.split("-") if part)
     return slug or "server"
+
+
+def _to_int(value: Any, default: int, *, min_value: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < min_value:
+        return default
+    return parsed
+
+
+def _to_float(value: Any, default: float, *, min_value: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < min_value:
+        return default
+    return parsed
+
+
+def _config_file_candidates(hf_model: str) -> list[Path]:
+    candidates: list[Path] = []
+    dedupe: set[str] = set()
+
+    model_tail = hf_model.split("/", 1)[-1]
+    for raw_name in (model_tail, hf_model):
+        slug = _sanitize_name(raw_name)
+        if slug in dedupe:
+            continue
+        dedupe.add(slug)
+        candidates.append(CONFIG_DIR / f"{slug}.json")
+
+    return candidates
+
+
+def _load_local_profile(hf_model: str) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "served_model_name": "",
+        "tensor_parallel_size": 1,
+        "dtype": "auto",
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 0,
+        "enforce_eager": False,
+        "trust_remote_code": True,
+    }
+
+    for candidate in _config_file_candidates(hf_model):
+        if not candidate.is_file():
+            continue
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            continue
+        if isinstance(payload.get("served_model_name"), str):
+            profile["served_model_name"] = payload["served_model_name"]
+        profile["tensor_parallel_size"] = _to_int(payload.get("tensor_parallel_size"), profile["tensor_parallel_size"], min_value=1)
+        if isinstance(payload.get("dtype"), str) and payload["dtype"].strip():
+            profile["dtype"] = payload["dtype"].strip()
+        profile["gpu_memory_utilization"] = _to_float(
+            payload.get("gpu_memory_utilization"),
+            profile["gpu_memory_utilization"],
+            min_value=0.0,
+        )
+        profile["max_model_len"] = _to_int(payload.get("max_model_len"), profile["max_model_len"], min_value=0)
+        if isinstance(payload.get("enforce_eager"), bool):
+            profile["enforce_eager"] = payload["enforce_eager"]
+        if isinstance(payload.get("trust_remote_code"), bool):
+            profile["trust_remote_code"] = payload["trust_remote_code"]
+        break
+
+    return profile
+
+
+def _resolve_local_start_settings(args: argparse.Namespace, model_name: str) -> dict[str, Any]:
+    profile = _load_local_profile(model_name)
+    return {
+        "served_model_name": args.served_model_name if args.served_model_name is not None else profile["served_model_name"],
+        "tensor_parallel_size": int(args.tensor_parallel_size) if args.tensor_parallel_size is not None else int(profile["tensor_parallel_size"]),
+        "dtype": str(args.dtype) if args.dtype is not None else str(profile["dtype"]),
+        "gpu_memory_utilization": float(args.gpu_memory_utilization) if args.gpu_memory_utilization is not None else float(profile["gpu_memory_utilization"]),
+        "max_model_len": int(args.max_model_len) if args.max_model_len is not None else int(profile["max_model_len"]),
+        "enforce_eager": bool(args.enforce_eager) if args.enforce_eager is not None else bool(profile["enforce_eager"]),
+        "trust_remote_code": bool(args.trust_remote_code) if args.trust_remote_code is not None else bool(profile["trust_remote_code"]),
+    }
 
 
 def _read_state() -> dict[str, Any]:
@@ -109,8 +198,109 @@ def _normalize_base_url(raw_url: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(path=path))
 
 
-def _build_local_command(args: argparse.Namespace) -> list[str]:
+def _prepend_env_path(env: dict[str, str], key: str, value: str) -> None:
+    existing = env.get(key, "").strip()
+    if not existing:
+        env[key] = value
+        return
+    parts = [part for part in existing.split(":") if part]
+    if value not in parts:
+        env[key] = ":".join([value, *parts])
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ensure_o200k_base_vocab() -> Path:
+    encodings_dir = STATE_DIR / "encodings"
+    target_path = encodings_dir / "o200k_base.tiktoken"
+    if target_path.is_file():
+        if _sha256_file(target_path) == O200K_BASE_TIKTOKEN_SHA256:
+            return encodings_dir
+        target_path.unlink()
+
+    encodings_dir.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        O200K_BASE_TIKTOKEN_URL,
+        headers={"User-Agent": "token-difr-serve/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        payload = response.read()
+
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != O200K_BASE_TIKTOKEN_SHA256:
+        raise RuntimeError(
+            "Downloaded o200k_base.tiktoken digest mismatch: "
+            f"expected {O200K_BASE_TIKTOKEN_SHA256}, got {digest}."
+        )
+
+    target_path.write_bytes(payload)
+    return encodings_dir
+
+
+def _build_local_runtime_env(model_name: str) -> dict[str, str]:
+    env = os.environ.copy()
+
+    try:
+        import vllm  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Local vLLM startup requires `vllm` in the active environment. "
+            "Reinstall `token-difr` so the default dependencies are present, for example:\n"
+            "uv pip install -e ."
+        ) from exc
+
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError(
+            "Local vLLM startup requires PyTorch to be installed in the active environment."
+        ) from exc
+
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        raise RuntimeError(
+            "Local vLLM startup requires a CUDA-enabled PyTorch build. "
+            "Reinstall `token-difr` with uv so it resolves the CUDA PyTorch wheels, for example:\n"
+            "uv pip install -e ."
+        )
+
+    torch_lib_dir = Path(torch.__file__).resolve().parent / "lib"
+    libtorch_cuda = torch_lib_dir / "libtorch_cuda.so"
+    if not libtorch_cuda.is_file():
+        raise RuntimeError(
+            f"Expected CUDA runtime library not found: {libtorch_cuda}. "
+            "Reinstall a CUDA-enabled PyTorch build before starting local vLLM."
+        )
+
+    _prepend_env_path(env, "LD_LIBRARY_PATH", str(torch_lib_dir))
+
+    if resolve_hf_name(model_name).startswith("openai/gpt-oss") and not env.get("TIKTOKEN_ENCODINGS_BASE"):
+        encodings_dir = _ensure_o200k_base_vocab()
+        env["TIKTOKEN_ENCODINGS_BASE"] = f"{encodings_dir}/"
+
+    return env
+
+
+def _build_local_command(args: argparse.Namespace, settings: dict[str, Any] | None = None) -> list[str]:
     model_name = resolve_hf_name(args.model)
+    if settings is None:
+        settings = {
+            "served_model_name": getattr(args, "served_model_name", ""),
+            "tensor_parallel_size": getattr(args, "tensor_parallel_size", 1),
+            "dtype": getattr(args, "dtype", "auto"),
+            "gpu_memory_utilization": getattr(args, "gpu_memory_utilization", 0.9),
+            "max_model_len": getattr(args, "max_model_len", 0),
+            "enforce_eager": getattr(args, "enforce_eager", False),
+            "trust_remote_code": getattr(args, "trust_remote_code", True),
+        }
     command = [
         sys.executable,
         "-m",
@@ -122,17 +312,19 @@ def _build_local_command(args: argparse.Namespace) -> list[str]:
         "--port",
         str(args.port),
         "--tensor-parallel-size",
-        str(args.tensor_parallel_size),
+        str(settings["tensor_parallel_size"]),
         "--dtype",
-        args.dtype,
+        str(settings["dtype"]),
         "--gpu-memory-utilization",
-        str(args.gpu_memory_utilization),
+        str(settings["gpu_memory_utilization"]),
     ]
-    if args.max_model_len and args.max_model_len > 0:
-        command.extend(["--max-model-len", str(args.max_model_len)])
-    if args.served_model_name:
-        command.extend(["--served-model-name", args.served_model_name])
-    if args.trust_remote_code:
+    if int(settings["max_model_len"]) > 0:
+        command.extend(["--max-model-len", str(settings["max_model_len"])])
+    if str(settings["served_model_name"]).strip():
+        command.extend(["--served-model-name", str(settings["served_model_name"])])
+    if bool(settings["enforce_eager"]):
+        command.append("--enforce-eager")
+    if bool(settings["trust_remote_code"]):
         command.append("--trust-remote-code")
     if args.extra_args:
         command.extend(shlex.split(args.extra_args))
@@ -154,13 +346,16 @@ def _local_start(args: argparse.Namespace) -> None:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"local-{name}.log"
-    command = _build_local_command(args)
+    settings = _resolve_local_start_settings(args, model_name)
+    command = _build_local_command(args, settings)
+    runtime_env = _build_local_runtime_env(model_name)
 
     with log_path.open("a", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
             command,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            env=runtime_env,
             start_new_session=True,
         )
 
@@ -187,6 +382,7 @@ def _local_start(args: argparse.Namespace) -> None:
         "log_file": str(log_path),
         "started_at_utc": _utc_now_iso(),
         "command": command,
+        **settings,
     }
     _write_state({"local_servers": local_servers, "modal_servers": state["modal_servers"]})
     print(f"Started local vLLM server {name}: pid={process.pid} base_url={_normalize_base_url(base_url)}")
@@ -447,13 +643,16 @@ def parse_args() -> argparse.Namespace:
     local_start.add_argument("--model", required=True, help="HuggingFace model to serve.")
     local_start.add_argument("--host", default=DEFAULT_LOCAL_HOST, help="Host to bind.")
     local_start.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT, help="Port to bind.")
-    local_start.add_argument("--served-model-name", default="", help="Optional served model alias.")
-    local_start.add_argument("--tensor-parallel-size", type=int, default=1)
-    local_start.add_argument("--dtype", default="auto")
-    local_start.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    local_start.add_argument("--max-model-len", type=int, default=0)
-    local_start.add_argument("--trust-remote-code", action="store_true", default=True)
+    local_start.add_argument("--served-model-name", default=None, help="Optional served model alias.")
+    local_start.add_argument("--tensor-parallel-size", type=int, default=None)
+    local_start.add_argument("--dtype", default=None)
+    local_start.add_argument("--gpu-memory-utilization", type=float, default=None)
+    local_start.add_argument("--max-model-len", type=int, default=None)
+    local_start.add_argument("--enforce-eager", dest="enforce_eager", action="store_true")
+    local_start.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false")
+    local_start.add_argument("--trust-remote-code", dest="trust_remote_code", action="store_true")
     local_start.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
+    local_start.set_defaults(enforce_eager=None, trust_remote_code=None)
     local_start.add_argument("--extra-args", default="", help="Extra args appended to the vLLM command.")
     local_start.add_argument("--start-timeout", type=int, default=180)
 

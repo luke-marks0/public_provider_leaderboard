@@ -12,6 +12,8 @@ SRC_DIR = TOKEN_DIFR_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+CANONICAL_PROMPTS_FILE = TOKEN_DIFR_ROOT / "reference_tokens" / "canonical_prompts.json"
+
 load_dotenv()
 
 from token_difr import construct_prompts
@@ -113,6 +115,8 @@ def _load_conversations(args: argparse.Namespace, model_name: str, output_dir: P
     prompt_source: Path | None = None
     if args.prompts_file:
         prompt_source = Path(args.prompts_file).expanduser().resolve()
+    elif CANONICAL_PROMPTS_FILE.is_file():
+        prompt_source = CANONICAL_PROMPTS_FILE
     else:
         prompt_source = _discover_prompt_source(
             output_dir,

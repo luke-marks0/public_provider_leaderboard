@@ -116,7 +116,7 @@ def verify_outputs(
         from vllm.inputs import TokensPrompt
     except ImportError as e:
         raise ImportError(
-            "vLLM backend requires the vllm package. Install with: pip install token-difr[all]"
+            "vLLM backend requires the vllm package. Install with: uv pip install -e ."
         ) from e
 
     if sampling_method != SamplingMethod.VLLM_GUMBEL_MAX:
