@@ -1,12 +1,9 @@
 # inference-provider-leaderboard
 
-This repository uses `token-difr/` as the inference-audit backend.
-
-`token-difr` is responsible for:
-- running local and Modal vLLM reference servers,
-- generating reference token bundles,
-- auditing provider outputs against a verification backend,
-- and checking whether two inference implementations behave equivalently under greedy decoding.
+This repository supports:
+- auditing inference provider outputs against reference inference implementations,
+- checking whether two inference implementations behave equivalently under greedy decoding,
+- reference inference implementations.
 
 ## Backend location
 
