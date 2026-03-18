@@ -14,6 +14,7 @@ import urllib.request
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -27,7 +28,14 @@ load_dotenv()
 from openai import AsyncOpenAI
 from transformers import AutoTokenizer
 
-from token_difr import FireworksVerificationError, audit_provider, construct_prompts, list_openrouter_providers
+from token_difr import (
+    FireworksVerificationError,
+    audit_provider,
+    collect_provider_sequences,
+    construct_prompts,
+    list_openrouter_providers,
+    verify_provider_sequences,
+)
 from token_difr.api import verify_outputs_fireworks, verify_outputs_openai_compatible
 from token_difr.common import TokenSequence, compute_metrics_summary
 from token_difr.model_registry import get_fireworks_name, guess_fireworks_name, resolve_hf_name
@@ -40,7 +48,24 @@ TOP_K = 50
 TOP_P = 0.95
 TEMPERATURE = 0.0
 FIREWORKS_MGMT_BASE_URL = "https://api.fireworks.ai"
+FIREWORKS_API_USER_AGENT = "token-difr-audit/1.0"
 STATE_FILE = Path(TOKEN_DIFR_ROOT) / "state" / "servers.json"
+CONFIG_DIR = Path(TOKEN_DIFR_ROOT) / "configs"
+DEFAULT_MODAL_APP_NAME = os.environ.get("TOKEN_DIFR_MODAL_APP_NAME", "token-difr-vllm")
+DEFAULT_MODAL_CLASS_NAME = os.environ.get("TOKEN_DIFR_MODAL_CLASS_NAME", "VllmServer")
+SENSITIVE_PARAMETER_FIELDS = {
+    "fireworks_on_demand_deployment",
+    "fireworks_serverless_model",
+    "fireworks_base_model_for_deployment",
+}
+SENSITIVE_PROVIDER_FIELDS = {
+    "fireworks_verification_target",
+}
+ORG_IDENTIFIER_PATTERN = re.compile(r"\borg_[A-Za-z0-9_-]+\b")
+COMPLETION_IDENTIFIER_PATTERN = re.compile(r"\bcmpl-[A-Za-z0-9_-]+\b")
+DEPLOYMENT_PATH_PATTERN = re.compile(
+    r"accounts/[A-Za-z0-9._-]+/deployments/[A-Za-z0-9._-]+"
+)
 
 
 def _normalize_openai_base_url(raw_base_url: str, *, ensure_v1_path: bool) -> str:
@@ -51,6 +76,25 @@ def _normalize_openai_base_url(raw_base_url: str, *, ensure_v1_path: bool) -> st
     if not path:
         path = "/"
     return urllib.parse.urlunparse(parsed._replace(path=path))
+
+
+def _split_openai_base_url_and_query(base_url: str) -> tuple[str, dict[str, str]]:
+    parsed = urllib.parse.urlparse(base_url.strip())
+    query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query: dict[str, str] = {key: value for key, value in query_pairs}
+    clean_base_url = urllib.parse.urlunparse(parsed._replace(query=""))
+    return clean_base_url, query
+
+
+def _create_async_openai_client(*, api_key: str, base_url: str) -> AsyncOpenAI:
+    clean_base_url, default_query = _split_openai_base_url_and_query(base_url)
+    if default_query:
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=clean_base_url,
+            default_query=default_query,
+        )
+    return AsyncOpenAI(api_key=api_key, base_url=clean_base_url)
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -65,6 +109,16 @@ def _get_env_int(name: str, default: int) -> int:
     except ValueError:
         print(f"Warning: invalid {name}={raw!r}; using default {default}.")
         return default
+
+
+DEFAULT_MODAL_AUDIT_MAX_MODEL_LEN_CAP = _get_env_int(
+    "TOKEN_DIFR_MODAL_AUDIT_MAX_MODEL_LEN_CAP",
+    8192,
+)
+DEFAULT_MODAL_VERIFICATION_CONCURRENCY = _get_env_int(
+    "TOKEN_DIFR_MODAL_VERIFICATION_CONCURRENCY",
+    1,
+)
 
 
 def _canonicalize_url_for_match(url: str) -> str:
@@ -173,6 +227,281 @@ def _stop_modal_verification_server(raw_base_url: str | None) -> None:
     print(f"Modal verification server {server_name} scaled down.")
 
 
+def _sanitize_name(value: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug or "server"
+
+
+def _to_int(value: Any, default: int, *, min_value: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < min_value:
+        return default
+    return parsed
+
+
+def _to_float(value: Any, default: float, *, min_value: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < min_value:
+        return default
+    return parsed
+
+
+def _config_file_candidates(hf_model: str) -> list[Path]:
+    candidates: list[Path] = []
+    dedupe: set[str] = set()
+
+    model_tail = hf_model.split("/", 1)[-1]
+    for raw_name in (model_tail, hf_model):
+        slug = _sanitize_name(raw_name)
+        if slug in dedupe:
+            continue
+        dedupe.add(slug)
+        candidates.append(CONFIG_DIR / f"{slug}.json")
+
+    return candidates
+
+
+def _load_modal_profile(hf_model: str) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "model": hf_model,
+        "served_model_name": "",
+        "tensor_parallel_size": 1,
+        "dtype": "auto",
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 0,
+        "max_num_seqs": 0,
+        "enforce_eager": False,
+        "trust_remote_code": True,
+        "modal_gpu": "H100",
+        "modal_min_containers": 0,
+        "modal_max_containers": 1,
+        "modal_scaledown_window_seconds": 60,
+    }
+
+    config_payload: dict[str, Any] | None = None
+    config_path: Path | None = None
+
+    for candidate in _config_file_candidates(hf_model):
+        if not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        config_payload = payload
+        config_path = candidate
+        break
+
+    if config_payload is None and CONFIG_DIR.is_dir():
+        for candidate in sorted(CONFIG_DIR.glob("*.json")):
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            model_name = payload.get("model")
+            if not isinstance(model_name, str):
+                continue
+            try:
+                resolved = resolve_hf_name(model_name)
+            except Exception:
+                resolved = model_name
+            if resolved != hf_model:
+                continue
+            config_payload = payload
+            config_path = candidate
+            break
+
+    if isinstance(config_payload, dict):
+        served_model_name = config_payload.get("served_model_name")
+        if isinstance(served_model_name, str):
+            profile["served_model_name"] = served_model_name
+
+        dtype = config_payload.get("dtype")
+        if isinstance(dtype, str) and dtype.strip():
+            profile["dtype"] = dtype
+
+        gpu = config_payload.get("modal_gpu")
+        if isinstance(gpu, str) and gpu.strip():
+            profile["modal_gpu"] = gpu
+
+        trust_remote_code = config_payload.get("trust_remote_code")
+        if isinstance(trust_remote_code, bool):
+            profile["trust_remote_code"] = trust_remote_code
+        enforce_eager = config_payload.get("enforce_eager")
+        if isinstance(enforce_eager, bool):
+            profile["enforce_eager"] = enforce_eager
+
+        profile["tensor_parallel_size"] = _to_int(
+            config_payload.get("tensor_parallel_size"),
+            1,
+            min_value=1,
+        )
+        profile["gpu_memory_utilization"] = _to_float(
+            config_payload.get("gpu_memory_utilization"),
+            0.9,
+            min_value=0.1,
+        )
+        profile["max_model_len"] = _to_int(config_payload.get("max_model_len"), 0, min_value=0)
+        profile["max_num_seqs"] = _to_int(config_payload.get("max_num_seqs"), 0, min_value=0)
+        profile["modal_min_containers"] = _to_int(config_payload.get("modal_min_containers"), 0, min_value=0)
+        profile["modal_max_containers"] = _to_int(config_payload.get("modal_max_containers"), 1, min_value=1)
+        profile["modal_scaledown_window_seconds"] = _to_int(
+            config_payload.get("modal_scaledown_window_seconds"),
+            60,
+            min_value=0,
+        )
+
+    # Audit runs use short prompts/generations; cap context length to avoid
+    # expensive or unstable cold starts from oversized KV-cache reservations.
+    cap = DEFAULT_MODAL_AUDIT_MAX_MODEL_LEN_CAP
+    max_model_len = _to_int(profile.get("max_model_len"), 0, min_value=0)
+    if max_model_len <= 0 or max_model_len > cap:
+        profile["max_model_len"] = cap
+
+    if config_path is not None:
+        profile["config_path"] = str(config_path)
+    return profile
+
+
+def _build_modal_start_command(
+    *,
+    server_name: str,
+    app_name: str,
+    class_name: str,
+    profile: dict[str, Any],
+    deploy: bool,
+) -> list[str]:
+    serve_script = os.path.join(TOKEN_DIFR_ROOT, "serve.py")
+    command = [
+        sys.executable,
+        serve_script,
+        "modal",
+        "start",
+        "--name",
+        server_name,
+        "--model",
+        str(profile["model"]),
+        "--app-name",
+        app_name,
+        "--class-name",
+        class_name,
+        "--gpu",
+        str(profile["modal_gpu"]),
+        "--min-containers",
+        "0",
+        "--max-containers",
+        str(_to_int(profile.get("modal_max_containers"), 1, min_value=1)),
+        "--scaledown-window-seconds",
+        str(profile["modal_scaledown_window_seconds"]),
+        "--tensor-parallel-size",
+        str(profile["tensor_parallel_size"]),
+        "--dtype",
+        str(profile["dtype"]),
+        "--gpu-memory-utilization",
+        str(profile["gpu_memory_utilization"]),
+        "--max-model-len",
+        str(profile["max_model_len"]),
+        "--max-num-seqs",
+        str(_to_int(profile.get("max_num_seqs"), 0, min_value=0)),
+    ]
+
+    served_model_name = str(profile.get("served_model_name") or "")
+    if served_model_name:
+        command.extend(["--served-model-name", served_model_name])
+
+    if bool(profile.get("trust_remote_code", True)):
+        command.append("--trust-remote-code")
+    else:
+        command.append("--no-trust-remote-code")
+    if bool(profile.get("enforce_eager", False)):
+        command.append("--enforce-eager")
+    else:
+        command.append("--no-enforce-eager")
+
+    if not deploy:
+        command.append("--no-deploy")
+
+    return command
+
+
+def _start_modal_verification_server_for_model(
+    *,
+    hf_model: str,
+    app_name: str,
+    class_name: str,
+    deploy: bool,
+) -> tuple[str, str, dict[str, Any]]:
+    profile = _load_modal_profile(hf_model)
+    profile["model"] = hf_model
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    server_name = f"audit-{_sanitize_name(hf_model)}-{timestamp}"
+    command = _build_modal_start_command(
+        server_name=server_name,
+        app_name=app_name,
+        class_name=class_name,
+        profile=profile,
+        deploy=deploy,
+    )
+    print(
+        "Starting modal verification server "
+        f"{server_name} (gpu={profile['modal_gpu']}, tp={profile['tensor_parallel_size']}, "
+        f"min_containers=0, max_containers={_to_int(profile.get('modal_max_containers'), 1, min_value=1)})"
+    )
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        raise RuntimeError(
+            "Failed to start modal verification server "
+            f"{server_name!r} (exit {completed.returncode}). stdout: {stdout} stderr: {stderr}"
+        )
+    if completed.stdout.strip():
+        print(completed.stdout.strip())
+
+    modal_servers = _read_modal_state()
+    entry = modal_servers.get(server_name)
+    if not isinstance(entry, dict):
+        raise RuntimeError(
+            f"Modal server {server_name!r} started but was not found in state file {STATE_FILE}."
+        )
+
+    base_url = entry.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise RuntimeError(f"Modal server {server_name!r} has no base URL recorded in state.")
+    normalized_base_url = _normalize_openai_base_url(base_url, ensure_v1_path=True)
+    return server_name, normalized_base_url, profile
+
+
+def _stop_modal_verification_server_by_name(server_name: str) -> None:
+    if not server_name.strip():
+        return
+    serve_script = os.path.join(TOKEN_DIFR_ROOT, "serve.py")
+    command = [sys.executable, serve_script, "modal", "stop", "--name", server_name]
+    print(f"Scaling down modal verification server {server_name} to zero containers...")
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        raise RuntimeError(
+            "Failed to stop modal verification server "
+            f"{server_name!r} (exit {completed.returncode}). stdout: {stdout} stderr: {stderr}"
+        )
+    if completed.stdout.strip():
+        print(completed.stdout.strip())
+
+
 def _extract_account_id(account_ref: str) -> str:
     """Extract account ID from either '<id>' or 'accounts/<id>'."""
     ref = account_ref.strip()
@@ -202,7 +531,11 @@ def _fireworks_request(
 ) -> dict:
     """Send a Fireworks management API request."""
     url = f"{FIREWORKS_MGMT_BASE_URL}{path}"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": FIREWORKS_API_USER_AGENT,
+    }
     data = None
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -214,6 +547,14 @@ def _fireworks_request(
             body = response.read().decode("utf-8").strip()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 403 and "/v1/accounts" in path:
+            raise RuntimeError(
+                "Fireworks API access denied for account discovery "
+                f"({method} {path}, HTTP 403). This is usually account-scope or WAF policy, not a bad key. "
+                "Set FIREWORKS_ACCOUNT_ID to bypass /v1/accounts listing, or use "
+                "--fireworks-create-deployment-cmd / --fireworks-verification-model. "
+                f"Response body: {body}"
+            ) from exc
         raise RuntimeError(f"Fireworks API {method} {path} failed ({exc.code}): {body}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Fireworks API {method} {path} failed: {exc}") from exc
@@ -531,8 +872,42 @@ def _wait_for_temp_fireworks_deployment_ready_via_api(
 
 
 def save_results(results: dict, output_file: str) -> None:
+    sanitized_results = _sanitize_results_for_public_output(results)
     with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(sanitized_results, f, indent=2)
+
+
+def _is_error_field_name(field_name: str) -> bool:
+    return field_name == "error" or field_name.endswith("_error")
+
+
+def _redact_error_text(text: str) -> str:
+    redacted = ORG_IDENTIFIER_PATTERN.sub("redacted", text)
+    redacted = COMPLETION_IDENTIFIER_PATTERN.sub("redacted", redacted)
+    redacted = DEPLOYMENT_PATH_PATTERN.sub("accounts/redacted/deployments/redacted", redacted)
+    return redacted
+
+
+def _sanitize_results_for_public_output(value: Any, *, parent_key: str = "") -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if parent_key == "parameters" and key in SENSITIVE_PARAMETER_FIELDS:
+                continue
+            if key in SENSITIVE_PROVIDER_FIELDS:
+                continue
+
+            if isinstance(item, str) and _is_error_field_name(key):
+                sanitized[key] = _redact_error_text(item)
+                continue
+
+            sanitized[key] = _sanitize_results_for_public_output(item, parent_key=key)
+        return sanitized
+
+    if isinstance(value, list):
+        return [_sanitize_results_for_public_output(item, parent_key=parent_key) for item in value]
+
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -589,8 +964,9 @@ def parse_args() -> argparse.Namespace:
         "--modal-verification-base-url",
         default=None,
         help=(
-            "OpenAI-compatible Modal verification base URL. Required when "
-            "--verification-backend=modal unless MODAL_VERIFICATION_BASE_URL is set."
+            "OpenAI-compatible Modal verification base URL. If omitted, audit.py auto-manages "
+            "a per-model Modal verification server and scales it down to zero after each model "
+            "(unless --no-modal-stop-after-verification is set)."
         ),
     )
     parser.add_argument(
@@ -602,13 +978,39 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--modal-app-name",
+        default=DEFAULT_MODAL_APP_NAME,
+        help="Modal app name used when auto-managing verification servers.",
+    )
+    parser.add_argument(
+        "--modal-class-name",
+        default=DEFAULT_MODAL_CLASS_NAME,
+        help="Modal class name used when auto-managing verification servers.",
+    )
+    parser.add_argument(
+        "--modal-deploy-before-start",
+        dest="modal_deploy_before_start",
+        action="store_true",
+        default=True,
+        help=(
+            "When auto-managing Modal verification, deploy modal_vllm_app.py before the first "
+            "model starts (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--no-modal-deploy-before-start",
+        dest="modal_deploy_before_start",
+        action="store_false",
+        help="Skip modal deploy and reuse an already deployed Modal app in auto-managed mode.",
+    )
+    parser.add_argument(
         "--modal-stop-after-verification",
         dest="modal_stop_after_verification",
         action="store_true",
         default=True,
         help=(
-            "Scale down tracked Modal verification server(s) to zero at the end of the audit "
-            "to stop billing (default: enabled)."
+            "Scale down tracked Modal verification server(s) to zero to stop billing "
+            "(default: enabled)."
         ),
     )
     parser.add_argument(
@@ -752,7 +1154,10 @@ def _compute_reference_metrics(
 
     async def _verify_modal(target_model: str, base_url: str):
         modal_api_key = os.environ.get("MODAL_VERIFICATION_API_KEY") or "modal-verification"
-        modal_client = AsyncOpenAI(api_key=modal_api_key, base_url=base_url)
+        modal_client = _create_async_openai_client(
+            api_key=modal_api_key,
+            base_url=base_url,
+        )
         return await verify_outputs_openai_compatible(
             sequences,
             vocab_size=vocab_size,
@@ -765,6 +1170,7 @@ def _compute_reference_metrics(
             topk_logprobs=5,
             backend_label="modal API",
             request_extra_body={"return_tokens_as_token_ids": True},
+            concurrency=DEFAULT_MODAL_VERIFICATION_CONCURRENCY,
         )
 
     backend = verification_backend.strip().lower()
@@ -831,13 +1237,24 @@ def _main_modal(
     use_reference_tokens: bool,
     modal_verification_base_url: str | None,
     modal_verification_model: str | None,
+    modal_stop_after_verification: bool,
+    modal_app_name: str,
+    modal_class_name: str,
+    modal_deploy_before_start: bool,
 ) -> None:
     raw_base_url = modal_verification_base_url or os.environ.get("MODAL_VERIFICATION_BASE_URL")
-    if not raw_base_url:
-        raise ValueError(
-            "Modal verification requires --modal-verification-base-url or MODAL_VERIFICATION_BASE_URL."
+    fixed_base_url = (
+        _normalize_openai_base_url(raw_base_url, ensure_v1_path=True)
+        if raw_base_url and str(raw_base_url).strip()
+        else None
+    )
+    auto_manage = fixed_base_url is None
+    if auto_manage:
+        print(
+            "No modal verification base URL provided. "
+            "Auto-managing per-model modal verification servers."
         )
-    normalized_base_url = _normalize_openai_base_url(raw_base_url, ensure_v1_path=True)
+    deploy_for_each_model = bool(modal_deploy_before_start and auto_manage)
 
     for requested_model in models:
         hf_model = resolve_hf_name(requested_model)
@@ -853,85 +1270,141 @@ def _main_modal(
             print(f"No providers listed for {hf_model}")
             continue
 
-        verification_target = modal_verification_model or hf_model
-        results = {
-            "model": hf_model,
-            "parameters": {
-                "n_prompts": N_PROMPTS,
-                "max_tokens": MAX_TOKENS,
-                "seed": SEED,
-                "top_k": TOP_K,
-                "top_p": TOP_P,
-                "temperature": TEMPERATURE,
-                "verification_backend": "modal",
-                "modal_verification_target": verification_target,
-                "modal_verification_base_url": normalized_base_url,
-            },
-            "providers": {},
-        }
+        verification_base_url = fixed_base_url
+        modal_server_name: str | None = None
+        modal_profile: dict[str, Any] | None = None
 
-        if use_reference_tokens:
-            prompts, reference_sequences = _load_reference_bundle(hf_model)
-            print(f"Loaded {len(reference_sequences)} reference sequences")
-            reference_metrics = _compute_reference_metrics(
-                hf_model,
-                reference_sequences,
-                verification_backend="modal",
-                modal_verification_base_url=normalized_base_url,
-                modal_verification_model=verification_target,
-            )
-            results["reference"] = reference_metrics
-        else:
-            prompts = construct_prompts(
-                n_prompts=N_PROMPTS,
-                model_name=hf_model,
-                system_prompt="You are a helpful assistant.",
-            )
-            print(f"Constructed {len(prompts)} prompts")
-
-        safe_model_name = hf_model.replace("/", "_")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = "audit_results"
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = f"{output_dir}/{safe_model_name}_audit_results_{timestamp}.json"
-        save_results(results, output_file)
-        print(f"Results will be saved to {output_file}")
-
-        for provider in providers:
-            print(f"\nAuditing provider: {provider}")
-            try:
-                result = audit_provider(
-                    prompts,
-                    model=hf_model,
-                    provider=provider,
-                    max_tokens=MAX_TOKENS,
-                    seed=SEED,
-                    top_k=TOP_K,
-                    top_p=TOP_P,
-                    temperature=TEMPERATURE,
-                    verification_backend="modal",
-                    verification_model=verification_target,
-                    verification_base_url=normalized_base_url,
+        try:
+            if auto_manage:
+                modal_server_name, verification_base_url, modal_profile = (
+                    _start_modal_verification_server_for_model(
+                        hf_model=hf_model,
+                        app_name=modal_app_name,
+                        class_name=modal_class_name,
+                        deploy=deploy_for_each_model,
+                    )
                 )
-                provider_results = asdict(result)
-                provider_results["verification_backend"] = "modal"
-                provider_results["verification_target"] = verification_target
-                results["providers"][provider] = provider_results
+                print(
+                    f"Using auto-managed modal verification endpoint for {hf_model}: {verification_base_url}"
+                )
+            if not verification_base_url:
+                raise ValueError(
+                    "Modal verification base URL is not available. "
+                    "Pass --modal-verification-base-url or configure auto-managed mode."
+                )
 
-                print(f"  Total tokens: {result.total_tokens}")
-                print(f"  Exact match rate: {result.exact_match_rate:.2%}")
-                print(f"  Avg probability: {result.avg_prob:.4f}")
-            except Exception as provider_error:
-                print(f"  ERROR: {provider_error}")
-                results["providers"][provider] = {
-                    "error": str(provider_error),
+            verification_target = modal_verification_model or hf_model
+            results = {
+                "model": hf_model,
+                "parameters": {
+                    "n_prompts": N_PROMPTS,
+                    "max_tokens": MAX_TOKENS,
+                    "seed": SEED,
+                    "top_k": TOP_K,
+                    "top_p": TOP_P,
+                    "temperature": TEMPERATURE,
                     "verification_backend": "modal",
-                    "verification_target": verification_target,
+                    "modal_verification_target": verification_target,
+                    "modal_verification_base_url": verification_base_url,
+                    "modal_verification_strategy": (
+                        "auto-managed-per-model" if auto_manage else "fixed-base-url"
+                    ),
+                    "modal_server_name": modal_server_name,
+                },
+                "providers": {},
+            }
+            if isinstance(modal_profile, dict):
+                modal_profile_summary = {
+                    "gpu": modal_profile.get("modal_gpu"),
+                    "tensor_parallel_size": modal_profile.get("tensor_parallel_size"),
+                    "dtype": modal_profile.get("dtype"),
+                    "gpu_memory_utilization": modal_profile.get("gpu_memory_utilization"),
+                    "max_model_len": modal_profile.get("max_model_len"),
+                    "max_num_seqs": modal_profile.get("max_num_seqs"),
+                    "enforce_eager": modal_profile.get("enforce_eager"),
+                    "max_containers": modal_profile.get("modal_max_containers"),
+                    "trust_remote_code": modal_profile.get("trust_remote_code"),
+                    "config_path": modal_profile.get("config_path"),
                 }
+                results["parameters"]["modal_profile"] = modal_profile_summary
 
+            if use_reference_tokens:
+                prompts, reference_sequences = _load_reference_bundle(hf_model)
+                print(f"Loaded {len(reference_sequences)} reference sequences")
+                reference_metrics = _compute_reference_metrics(
+                    hf_model,
+                    reference_sequences,
+                    verification_backend="modal",
+                    modal_verification_base_url=verification_base_url,
+                    modal_verification_model=verification_target,
+                )
+                results["reference"] = reference_metrics
+            else:
+                prompts = construct_prompts(
+                    n_prompts=N_PROMPTS,
+                    model_name=hf_model,
+                    system_prompt="You are a helpful assistant.",
+                )
+                print(f"Constructed {len(prompts)} prompts")
+
+            safe_model_name = hf_model.replace("/", "_")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = "audit_results"
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = f"{output_dir}/{safe_model_name}_audit_results_{timestamp}.json"
             save_results(results, output_file)
+            print(f"Results will be saved to {output_file}")
 
-        print(f"\nAll results saved to {output_file}")
+            for provider in providers:
+                print(f"\nAuditing provider: {provider}")
+                try:
+                    result = audit_provider(
+                        prompts,
+                        model=hf_model,
+                        provider=provider,
+                        max_tokens=MAX_TOKENS,
+                        seed=SEED,
+                        top_k=TOP_K,
+                        top_p=TOP_P,
+                        temperature=TEMPERATURE,
+                        verification_backend="modal",
+                        verification_model=verification_target,
+                        verification_base_url=verification_base_url,
+                    )
+                    provider_results = asdict(result)
+                    provider_results["verification_backend"] = "modal"
+                    provider_results["verification_target"] = verification_target
+                    results["providers"][provider] = provider_results
+
+                    print(f"  Total tokens: {result.total_tokens}")
+                    print(f"  Exact match rate: {result.exact_match_rate:.2%}")
+                    print(f"  Avg probability: {result.avg_prob:.4f}")
+                except Exception as provider_error:
+                    print(f"  ERROR: {provider_error}")
+                    results["providers"][provider] = {
+                        "error": str(provider_error),
+                        "verification_backend": "modal",
+                        "verification_target": verification_target,
+                    }
+
+                save_results(results, output_file)
+
+            print(f"\nAll results saved to {output_file}")
+        finally:
+            if auto_manage and modal_server_name and modal_stop_after_verification:
+                try:
+                    _stop_modal_verification_server_by_name(modal_server_name)
+                except Exception as teardown_error:
+                    print(
+                        "Warning: failed to scale down auto-managed modal verification server "
+                        f"{modal_server_name}: {teardown_error}"
+                    )
+
+    if fixed_base_url and modal_stop_after_verification:
+        try:
+            _stop_modal_verification_server(fixed_base_url)
+        except Exception as teardown_error:
+            print(f"Warning: Modal teardown failed: {teardown_error}")
 
 
 def main(
@@ -944,23 +1417,22 @@ def main(
     modal_verification_base_url: str | None = None,
     modal_verification_model: str | None = None,
     modal_stop_after_verification: bool = True,
+    modal_app_name: str = DEFAULT_MODAL_APP_NAME,
+    modal_class_name: str = DEFAULT_MODAL_CLASS_NAME,
+    modal_deploy_before_start: bool = True,
 ) -> None:
     backend = verification_backend.strip().lower()
     if backend == "modal":
-        teardown_base_url = modal_verification_base_url or os.environ.get("MODAL_VERIFICATION_BASE_URL")
-        try:
-            _main_modal(
-                models=models,
-                use_reference_tokens=use_reference_tokens,
-                modal_verification_base_url=modal_verification_base_url,
-                modal_verification_model=modal_verification_model,
-            )
-        finally:
-            if modal_stop_after_verification:
-                try:
-                    _stop_modal_verification_server(teardown_base_url)
-                except Exception as teardown_error:
-                    print(f"Warning: Modal teardown failed: {teardown_error}")
+        _main_modal(
+            models=models,
+            use_reference_tokens=use_reference_tokens,
+            modal_verification_base_url=modal_verification_base_url,
+            modal_verification_model=modal_verification_model,
+            modal_stop_after_verification=modal_stop_after_verification,
+            modal_app_name=modal_app_name,
+            modal_class_name=modal_class_name,
+            modal_deploy_before_start=modal_deploy_before_start,
+        )
         return
     if backend != "fireworks":
         raise ValueError(f"Unsupported verification backend: {verification_backend}")
@@ -1062,6 +1534,55 @@ def main(
             )
             return model_fallback_deployment
 
+        def recycle_fallback_deployment_for_retry(reason: str) -> str:
+            nonlocal model_fallback_deployment
+            nonlocal created_deployment_for_model
+            nonlocal created_deployment_via_api
+            nonlocal deployment_account_id
+
+            if model_fallback_deployment and not created_deployment_for_model:
+                print(
+                    f"{reason} Fallback deployment is externally managed; "
+                    "retrying once with the same deployment."
+                )
+                return model_fallback_deployment
+
+            if model_fallback_deployment and created_deployment_for_model:
+                failing_deployment = model_fallback_deployment
+                print(f"{reason} Deleting failing on-demand deployment: {failing_deployment}")
+                try:
+                    if fireworks_delete_deployment_cmd:
+                        _delete_temp_fireworks_deployment(
+                            fireworks_delete_deployment_cmd,
+                            deployment=failing_deployment,
+                            model=HF_MODEL,
+                            fireworks_model=base_fireworks_model,
+                        )
+                    else:
+                        if not fireworks_api_key:
+                            raise ValueError("FIREWORKS_API_KEY environment variable not set")
+                        if deployment_account_id is None:
+                            deployment_account_id = _resolve_fireworks_account_id(fireworks_api_key)
+                        _delete_temp_fireworks_deployment_via_api(
+                            api_key=fireworks_api_key,
+                            deployment=failing_deployment,
+                            fallback_account_id=deployment_account_id,
+                        )
+                except Exception as delete_error:
+                    print(
+                        "Warning: failed to delete failing on-demand deployment "
+                        f"{failing_deployment}: {delete_error}"
+                    )
+                finally:
+                    if model_fallback_deployment == failing_deployment:
+                        model_fallback_deployment = None
+                    created_deployment_for_model = False
+                    created_deployment_via_api = False
+
+            return ensure_fallback_deployment(
+                f"{reason} Creating fallback deployment for one final retry."
+            )
+
         if model_fallback_deployment:
             print(f"Using Fireworks on-demand fallback deployment: {model_fallback_deployment}")
 
@@ -1153,17 +1674,47 @@ def main(
             save_results(results, output_file)
             print(f"Results will be saved to {output_file}")
 
+            collected_provider_sequences: dict[str, tuple[list[TokenSequence], int]] = {}
+            skip_remaining_providers = False
             for provider in providers:
-                print(f"\nAuditing provider: {provider}")
+                print(f"\nCollecting tokens for provider: {provider}")
+                try:
+                    sequences, vocab_size = collect_provider_sequences(
+                        prompts,
+                        model=HF_MODEL,
+                        provider=provider,
+                        max_tokens=MAX_TOKENS,
+                        seed=SEED,
+                        temperature=TEMPERATURE,
+                    )
+                    collected_provider_sequences[provider] = (sequences, vocab_size)
+                    token_count = sum(len(sequence.output_token_ids) for sequence in sequences)
+                    results["providers"][provider] = {
+                        "collection_complete": True,
+                        "collected_sequences": len(sequences),
+                        "collected_tokens": token_count,
+                    }
+                    print(f"  Collected {token_count} tokens across {len(sequences)} sequences")
+                except Exception as provider_error:
+                    print(f"  ERROR during token collection: {provider_error}")
+                    results["providers"][provider] = {"error": str(provider_error), "collection_complete": False}
+
+                save_results(results, output_file)
+
+            for provider in providers:
+                if provider not in collected_provider_sequences:
+                    continue
+
+                sequences, vocab_size = collected_provider_sequences[provider]
+                print(f"\nVerifying provider: {provider}")
                 try:
                     if verification_mode == "on-demand":
                         if not model_fallback_deployment:
                             raise RuntimeError("on-demand verification mode selected but no deployment is available")
-                        result = audit_provider(
-                            prompts,
+                        result = verify_provider_sequences(
+                            sequences,
+                            vocab_size=vocab_size,
                             model=HF_MODEL,
-                            provider=provider,
-                            max_tokens=MAX_TOKENS,
                             seed=SEED,
                             top_k=TOP_K,
                             top_p=TOP_P,
@@ -1175,11 +1726,10 @@ def main(
                         provider_results["fireworks_verification_target"] = model_fallback_deployment
                         results["providers"][provider] = provider_results
                     else:
-                        result = audit_provider(
-                            prompts,
+                        result = verify_provider_sequences(
+                            sequences,
+                            vocab_size=vocab_size,
                             model=HF_MODEL,
-                            provider=provider,
-                            max_tokens=MAX_TOKENS,
                             seed=SEED,
                             top_k=TOP_K,
                             top_p=TOP_P,
@@ -1196,73 +1746,152 @@ def main(
 
                 except FireworksVerificationError as serverless_error:
                     if verification_mode == "on-demand":
-                        print(f"  ERROR: {serverless_error}")
-                        results["providers"][provider] = {
-                            "error": str(serverless_error),
-                            "fireworks_verification_mode": "on-demand",
-                            "fireworks_verification_target": model_fallback_deployment,
-                        }
-                        save_results(results, output_file)
-                        continue
-
-                    if not model_fallback_deployment:
+                        print(f"  On-demand verification failed: {serverless_error}")
                         try:
-                            ensure_fallback_deployment("Serverless verification failed.")
-                            results["parameters"]["fireworks_on_demand_deployment"] = model_fallback_deployment
+                            fallback = recycle_fallback_deployment_for_retry(
+                                "On-demand verification failed."
+                            )
+                            results["parameters"]["fireworks_on_demand_deployment"] = fallback
                             results["parameters"]["fireworks_deployment_created_for_audit"] = (
                                 created_deployment_for_model
                             )
-                        except Exception as create_error:
-                            print(f"  ERROR: {serverless_error}")
-                            print(f"  ERROR: unable to create fallback deployment: {create_error}")
+                            print(f"  Retrying once with on-demand deployment: {fallback}")
+                            result = verify_provider_sequences(
+                                sequences,
+                                vocab_size=vocab_size,
+                                model=HF_MODEL,
+                                seed=SEED,
+                                top_k=TOP_K,
+                                top_p=TOP_P,
+                                temperature=TEMPERATURE,
+                                fireworks_verification_model=fallback,
+                            )
+                            provider_results = asdict(result)
+                            provider_results["fireworks_verification_mode"] = "on-demand"
+                            provider_results["fireworks_verification_target"] = fallback
+                            provider_results["on_demand_first_error"] = str(serverless_error)
+                            results["providers"][provider] = provider_results
+                            print(f"  Total tokens: {result.total_tokens}")
+                            print(f"  Exact match rate: {result.exact_match_rate:.2%}")
+                            print(f"  Avg probability: {result.avg_prob:.4f}")
+                        except Exception as final_on_demand_error:
+                            print(
+                                "  ERROR: on-demand retry after deployment recycle failed: "
+                                f"{final_on_demand_error}"
+                            )
                             results["providers"][provider] = {
-                                "error": str(serverless_error),
-                                "fallback_error": str(create_error),
+                                "error": str(final_on_demand_error),
+                                "on_demand_first_error": str(serverless_error),
+                                "fireworks_verification_mode": "on-demand-fallback-failed",
+                                "fireworks_verification_target": model_fallback_deployment,
                             }
-                            save_results(results, output_file)
-                            continue
+                            results["parameters"]["model_skipped_after_provider"] = provider
+                            results["parameters"]["model_skipped_reason"] = (
+                                "on-demand verification failed after one recycle/retry"
+                            )
+                            skip_remaining_providers = True
 
-                    verification_mode = "on-demand"
-                    results["parameters"]["fireworks_verification_mode"] = verification_mode
-                    print(f"  Serverless verification failed: {serverless_error}")
-                    print("  Switching verification mode to on-demand for remaining providers.")
-                    print(f"  Retrying with on-demand deployment: {model_fallback_deployment}")
-                    try:
-                        result = audit_provider(
-                            prompts,
-                            model=HF_MODEL,
-                            provider=provider,
-                            max_tokens=MAX_TOKENS,
-                            seed=SEED,
-                            top_k=TOP_K,
-                            top_p=TOP_P,
-                            temperature=TEMPERATURE,
-                            fireworks_verification_model=model_fallback_deployment,
-                        )
-                        provider_results = asdict(result)
-                        provider_results["fireworks_verification_mode"] = "on-demand"
-                        provider_results["fireworks_verification_target"] = model_fallback_deployment
-                        provider_results["serverless_error"] = str(serverless_error)
-                        results["providers"][provider] = provider_results
+                    else:
+                        if not model_fallback_deployment:
+                            try:
+                                ensure_fallback_deployment("Serverless verification failed.")
+                                results["parameters"]["fireworks_on_demand_deployment"] = model_fallback_deployment
+                                results["parameters"]["fireworks_deployment_created_for_audit"] = (
+                                    created_deployment_for_model
+                                )
+                            except Exception as create_error:
+                                print(f"  ERROR: {serverless_error}")
+                                print(f"  ERROR: unable to create fallback deployment: {create_error}")
+                                results["providers"][provider] = {
+                                    "error": str(serverless_error),
+                                    "fallback_error": str(create_error),
+                                }
+                                save_results(results, output_file)
+                                continue
 
-                        print(f"  Total tokens: {result.total_tokens}")
-                        print(f"  Exact match rate: {result.exact_match_rate:.2%}")
-                        print(f"  Avg probability: {result.avg_prob:.4f}")
-                        print("  Verification target: on-demand deployment fallback")
-                    except Exception as on_demand_error:
-                        print(f"  ERROR: on-demand fallback also failed: {on_demand_error}")
-                        results["providers"][provider] = {
-                            "error": str(on_demand_error),
-                            "serverless_error": str(serverless_error),
-                            "fireworks_verification_mode": "on-demand-fallback-failed",
-                            "fireworks_verification_target": model_fallback_deployment,
-                        }
+                        verification_mode = "on-demand"
+                        results["parameters"]["fireworks_verification_mode"] = verification_mode
+                        print(f"  Serverless verification failed: {serverless_error}")
+                        print("  Switching verification mode to on-demand for remaining providers.")
+                        print(f"  Retrying with on-demand deployment: {model_fallback_deployment}")
+                        try:
+                            result = verify_provider_sequences(
+                                sequences,
+                                vocab_size=vocab_size,
+                                model=HF_MODEL,
+                                seed=SEED,
+                                top_k=TOP_K,
+                                top_p=TOP_P,
+                                temperature=TEMPERATURE,
+                                fireworks_verification_model=model_fallback_deployment,
+                            )
+                            provider_results = asdict(result)
+                            provider_results["fireworks_verification_mode"] = "on-demand"
+                            provider_results["fireworks_verification_target"] = model_fallback_deployment
+                            provider_results["serverless_error"] = str(serverless_error)
+                            results["providers"][provider] = provider_results
+
+                            print(f"  Total tokens: {result.total_tokens}")
+                            print(f"  Exact match rate: {result.exact_match_rate:.2%}")
+                            print(f"  Avg probability: {result.avg_prob:.4f}")
+                            print("  Verification target: on-demand deployment fallback")
+                        except Exception as on_demand_error:
+                            print(f"  On-demand fallback failed: {on_demand_error}")
+                            try:
+                                fallback = recycle_fallback_deployment_for_retry(
+                                    "On-demand fallback failed."
+                                )
+                                results["parameters"]["fireworks_on_demand_deployment"] = fallback
+                                results["parameters"]["fireworks_deployment_created_for_audit"] = (
+                                    created_deployment_for_model
+                                )
+                                print(f"  Retrying once with on-demand deployment: {fallback}")
+                                result = verify_provider_sequences(
+                                    sequences,
+                                    vocab_size=vocab_size,
+                                    model=HF_MODEL,
+                                    seed=SEED,
+                                    top_k=TOP_K,
+                                    top_p=TOP_P,
+                                    temperature=TEMPERATURE,
+                                    fireworks_verification_model=fallback,
+                                )
+                                provider_results = asdict(result)
+                                provider_results["fireworks_verification_mode"] = "on-demand"
+                                provider_results["fireworks_verification_target"] = fallback
+                                provider_results["serverless_error"] = str(serverless_error)
+                                provider_results["on_demand_first_error"] = str(on_demand_error)
+                                results["providers"][provider] = provider_results
+                                print(f"  Total tokens: {result.total_tokens}")
+                                print(f"  Exact match rate: {result.exact_match_rate:.2%}")
+                                print(f"  Avg probability: {result.avg_prob:.4f}")
+                                print("  Verification target: recycled on-demand deployment")
+                            except Exception as final_on_demand_error:
+                                print(
+                                    "  ERROR: on-demand retry after deployment recycle failed: "
+                                    f"{final_on_demand_error}"
+                                )
+                                results["providers"][provider] = {
+                                    "error": str(final_on_demand_error),
+                                    "serverless_error": str(serverless_error),
+                                    "on_demand_first_error": str(on_demand_error),
+                                    "fireworks_verification_mode": "on-demand-fallback-failed",
+                                    "fireworks_verification_target": model_fallback_deployment,
+                                }
+                                results["parameters"]["model_skipped_after_provider"] = provider
+                                results["parameters"]["model_skipped_reason"] = (
+                                    "on-demand verification failed after one recycle/retry"
+                                )
+                                skip_remaining_providers = True
                 except Exception as provider_error:
                     print(f"  ERROR: {provider_error}")
                     results["providers"][provider] = {"error": str(provider_error)}
 
                 # Save after each provider completes
                 save_results(results, output_file)
+                if skip_remaining_providers:
+                    print("  Skipping remaining providers for this model to avoid wasted credits.")
+                    break
 
             print(f"\nAll results saved to {output_file}")
         finally:
@@ -1310,4 +1939,7 @@ if __name__ == "__main__":
         args.modal_verification_base_url,
         args.modal_verification_model,
         args.modal_stop_after_verification,
+        args.modal_app_name,
+        args.modal_class_name,
+        args.modal_deploy_before_start,
     )

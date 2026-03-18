@@ -11,7 +11,13 @@ from token_difr.api import (
     verify_outputs_openai_compatible,
     verify_outputs_tinker,
 )
-from token_difr.audit import AuditResult, FireworksVerificationError, audit_provider
+from token_difr.audit import (
+    AuditResult,
+    FireworksVerificationError,
+    audit_provider,
+    collect_provider_sequences,
+    verify_provider_sequences,
+)
 from token_difr.common import (
     SamplingMethod,
     TokenMetrics,
@@ -36,6 +42,8 @@ __version__ = "0.1.2"
 __all__ = [
     # High-level audit API
     "audit_provider",
+    "collect_provider_sequences",
+    "verify_provider_sequences",
     "AuditResult",
     "FireworksVerificationError",
     "construct_prompts",

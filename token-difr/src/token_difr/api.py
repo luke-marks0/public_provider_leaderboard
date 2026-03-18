@@ -93,8 +93,14 @@ async def _fetch_openai_compatible_logprobs(
         logprobs=True,
         extra_body=extra_body,
     )
-
-    return response.choices[0].logprobs
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise RuntimeError("OpenAI-compatible completion response is missing choices.")
+    first_choice = choices[0]
+    logprobs = getattr(first_choice, "logprobs", None)
+    if logprobs is None:
+        raise RuntimeError("OpenAI-compatible completion response is missing logprobs.")
+    return logprobs
 
 
 def _iter_tinker_logprobs(
@@ -241,24 +247,33 @@ async def _fetch_all_openai_compatible_logprobs(
     semaphore = asyncio.Semaphore(concurrency)
 
     async def fetch_one(i: int, req: TokenSequence) -> SparseLogprobs:
-        async with semaphore:
-            prompt_token_ids = list(req.prompt_token_ids)
-            gen_ids = list(req.output_token_ids)
-            logprobs_payload = await _fetch_openai_compatible_logprobs(
-                prompt_token_ids=prompt_token_ids,
-                gen_ids=gen_ids,
-                client=client,
-                model=model,
-                topk_logprobs=topk_logprobs,
-                request_extra_body=request_extra_body,
-            )
+        prompt_token_ids = list(req.prompt_token_ids)
+        gen_ids = list(req.output_token_ids)
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                async with semaphore:
+                    logprobs_payload = await _fetch_openai_compatible_logprobs(
+                        prompt_token_ids=prompt_token_ids,
+                        gen_ids=gen_ids,
+                        client=client,
+                        model=model,
+                        topk_logprobs=topk_logprobs,
+                        request_extra_body=request_extra_body,
+                    )
 
-            sparse_logprobs = _openai_logprobs_to_sparse_logprobs(
-                logprobs_payload=logprobs_payload,
-                start_idx=len(prompt_token_ids),
-                n_tokens=len(gen_ids),
-            )
-            return SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
+                sparse_logprobs = _openai_logprobs_to_sparse_logprobs(
+                    logprobs_payload=logprobs_payload,
+                    start_idx=len(prompt_token_ids),
+                    n_tokens=len(gen_ids),
+                )
+                return SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
+            except Exception:
+                if attempt >= attempts:
+                    raise
+                await asyncio.sleep(float(attempt))
+
+        raise RuntimeError("Unreachable retry state while fetching OpenAI-compatible logprobs.")
 
     tasks = [fetch_one(i, req) for i, req in enumerate(outputs) if len(req.output_token_ids) > 0]
 

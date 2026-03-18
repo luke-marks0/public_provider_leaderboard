@@ -1,12 +1,13 @@
 {
-  "model": "org/model-name",
+  "model": "Qwen/Qwen3-32B",
   "served_model_name": "",
   "tensor_parallel_size": 1,
-  "dtype": "float16",
+  "dtype": "bfloat16",
   "gpu_memory_utilization": 0.9,
-  "max_model_len": 32768,
+  "max_model_len": 4096,
   "trust_remote_code": false,
-  "modal_gpu": "H100",
+  "modal_gpu": "A100-80GB",
   "modal_min_containers": 1,
+  "modal_max_containers": 1,
   "modal_scaledown_window_seconds": 60
 }

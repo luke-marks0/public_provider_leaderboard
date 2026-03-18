@@ -43,8 +43,10 @@ def test_build_modal_query_params_encodes_expected_fields() -> None:
         "dtype": "auto",
         "gpu_memory_utilization": 0.9,
         "max_model_len": 0,
+        "max_num_seqs": 32,
         "trust_remote_code": True,
     }
     params = serve._build_modal_query_params(entry)
     assert params["model_name"] == "Qwen/Qwen3-8B"
+    assert params["max_num_seqs"] == 32
     assert params["trust_remote_code"] is True

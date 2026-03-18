@@ -34,8 +34,9 @@ DEFAULT_LOCAL_PORT = 8000
 DEFAULT_MODAL_APP_NAME = "token-difr-vllm"
 DEFAULT_MODAL_CLASS_NAME = "VllmServer"
 DEFAULT_MODAL_GPU = "H100"
-DEFAULT_MODAL_MIN_CONTAINERS = 1
-DEFAULT_MODAL_SCALEDOWN_WINDOW_SECONDS = 600
+DEFAULT_MODAL_MIN_CONTAINERS = 0
+DEFAULT_MODAL_MAX_CONTAINERS = 1
+DEFAULT_MODAL_SCALEDOWN_WINDOW_SECONDS = 60
 
 
 def _utc_now_iso() -> str:
@@ -291,6 +292,8 @@ def _build_modal_query_params(entry: dict[str, Any]) -> dict[str, Any]:
         "dtype": str(entry["dtype"]),
         "gpu_memory_utilization": str(entry["gpu_memory_utilization"]),
         "max_model_len": int(entry["max_model_len"]),
+        "max_num_seqs": int(entry.get("max_num_seqs", 0)),
+        "enforce_eager": bool(entry.get("enforce_eager", False)),
         "trust_remote_code": bool(entry["trust_remote_code"]),
     }
 
@@ -318,9 +321,12 @@ def _modal_start(args: argparse.Namespace) -> None:
     modal_app_file = (TOKEN_DIFR_ROOT / "modal_vllm_app.py").resolve()
 
     if args.deploy:
+        deploy_env = os.environ.copy()
+        deploy_env["TOKEN_DIFR_MODAL_GPU"] = str(args.gpu)
         subprocess.run(
             ["modal", "deploy", str(modal_app_file), "--name", app_name],
             check=True,
+            env=deploy_env,
         )
 
     modal = _import_modal()
@@ -338,11 +344,14 @@ def _modal_start(args: argparse.Namespace) -> None:
         "dtype": args.dtype,
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "max_model_len": int(args.max_model_len),
+        "max_num_seqs": int(args.max_num_seqs),
+        "enforce_eager": bool(args.enforce_eager),
         "trust_remote_code": bool(args.trust_remote_code),
         "app_name": app_name,
         "class_name": class_name,
         "gpu": args.gpu,
         "min_containers": min_containers,
+        "max_containers": int(args.max_containers),
         "scaledown_window_seconds": scaledown_window_seconds,
         "app_file": str(modal_app_file),
         "started_at_utc": _utc_now_iso(),
@@ -351,6 +360,7 @@ def _modal_start(args: argparse.Namespace) -> None:
     instance = cls_obj(**params)
     instance.update_autoscaler(
         min_containers=min_containers,
+        max_containers=int(args.max_containers),
         scaledown_window=scaledown_window_seconds,
     )
     web_url = instance.serve.get_web_url()
@@ -382,16 +392,27 @@ def _modal_stop(args: argparse.Namespace) -> None:
             print(f"Modal server {name!r} not found in state.")
             continue
 
-        cls_obj = modal.Cls.from_name(str(entry["app_name"]), str(entry["class_name"]))
-        cls_obj = cls_obj.with_options(
-            gpu=str(entry["gpu"]),
-            scaledown_window=int(entry["scaledown_window_seconds"]),
-        )
-        params = _build_modal_query_params(entry)
-        instance = cls_obj(**params)
-        instance.update_autoscaler(min_containers=0)
-        modal_servers.pop(name, None)
-        print(f"Scaled down modal server {name} to zero containers.")
+        try:
+            cls_obj = modal.Cls.from_name(str(entry["app_name"]), str(entry["class_name"]))
+            cls_obj = cls_obj.with_options(
+                gpu=str(entry["gpu"]),
+                scaledown_window=int(entry["scaledown_window_seconds"]),
+            )
+            params = _build_modal_query_params(entry)
+            instance = cls_obj(**params)
+            instance.update_autoscaler(
+                min_containers=0,
+                max_containers=int(entry.get("max_containers", DEFAULT_MODAL_MAX_CONTAINERS)),
+                scaledown_window=0,
+            )
+            print(f"Scaled down modal server {name} to zero containers.")
+        except Exception as exc:
+            print(
+                f"Modal server {name!r} could not be updated (likely already gone): {exc}. "
+                "Removing stale state entry."
+            )
+        finally:
+            modal_servers.pop(name, None)
 
     _write_state({"local_servers": state["local_servers"], "modal_servers": modal_servers})
 
@@ -453,11 +474,15 @@ def parse_args() -> argparse.Namespace:
     modal_start.add_argument("--class-name", default=DEFAULT_MODAL_CLASS_NAME, help="Modal class name.")
     modal_start.add_argument("--gpu", default=DEFAULT_MODAL_GPU, help="Modal GPU request (e.g. H100 or H100:4).")
     modal_start.add_argument("--min-containers", type=int, default=DEFAULT_MODAL_MIN_CONTAINERS)
+    modal_start.add_argument("--max-containers", type=int, default=DEFAULT_MODAL_MAX_CONTAINERS)
     modal_start.add_argument("--scaledown-window-seconds", type=int, default=DEFAULT_MODAL_SCALEDOWN_WINDOW_SECONDS)
     modal_start.add_argument("--tensor-parallel-size", type=int, default=1)
     modal_start.add_argument("--dtype", default="auto")
     modal_start.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     modal_start.add_argument("--max-model-len", type=int, default=0)
+    modal_start.add_argument("--max-num-seqs", type=int, default=0)
+    modal_start.add_argument("--enforce-eager", action="store_true", default=False)
+    modal_start.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false")
     modal_start.add_argument("--trust-remote-code", action="store_true", default=True)
     modal_start.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
     modal_start.add_argument(

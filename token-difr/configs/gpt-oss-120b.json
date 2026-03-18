@@ -4,9 +4,12 @@
   "tensor_parallel_size": 1,
   "dtype": "bfloat16",
   "gpu_memory_utilization": 0.9,
-  "max_model_len": 131072,
+  "max_model_len": 2048,
+  "max_num_seqs": 16,
+  "enforce_eager": true,
   "trust_remote_code": false,
   "modal_gpu": "H100",
-  "modal_min_containers": 1,
-  "modal_scaledown_window_seconds": 600
+  "modal_min_containers": 0,
+  "modal_max_containers": 1,
+  "modal_scaledown_window_seconds": 60
 }

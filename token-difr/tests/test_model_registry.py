@@ -7,6 +7,10 @@ def test_resolve_hf_name_case_insensitive() -> None:
     assert resolve_hf_name("qwen/qwen3-8b") == "Qwen/Qwen3-8B"
 
 
+def test_resolve_hf_name_openrouter_alias_qwen3_32b() -> None:
+    assert resolve_hf_name("qwen/qwen3-32b") == "Qwen/Qwen3-32B"
+
+
 def test_resolve_hf_name_openrouter_alias() -> None:
     assert resolve_hf_name("qwen/qwen3-235b-a22b-2507") == "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
@@ -17,6 +21,10 @@ def test_resolve_hf_name_openrouter_alias_deepseek() -> None:
 
 def test_get_fireworks_name_from_alias() -> None:
     assert get_fireworks_name("qwen/qwen3-8b") == "accounts/fireworks/models/qwen3-8b"
+
+
+def test_get_fireworks_name_from_alias_qwen3_32b() -> None:
+    assert get_fireworks_name("qwen/qwen3-32b") == "accounts/fireworks/models/qwen3-32b"
 
 
 def test_get_fireworks_name_from_alias_minimax() -> None:

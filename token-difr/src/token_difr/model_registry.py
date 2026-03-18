@@ -18,6 +18,7 @@ FIREWORKS_MODEL_REGISTRY: dict[str, str] = {
     # Qwen models
     "Qwen/Qwen2.5-72B-Instruct": "accounts/fireworks/models/qwen2p5-72b-instruct",
     "Qwen/Qwen3-8B": "accounts/fireworks/models/qwen3-8b",
+    "Qwen/Qwen3-32B": "accounts/fireworks/models/qwen3-32b",
     "Qwen/Qwen3-235B-A22B-Instruct-2507": "accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
     "Qwen/Qwen3-Coder-480B-A35B-Instruct": "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
     # DeepSeek models
@@ -35,6 +36,7 @@ FIREWORKS_MODEL_REGISTRY: dict[str, str] = {
 
 # HuggingFace name -> OpenRouter name (only for models that differ from hf_name.lower())
 OPENROUTER_MODEL_REGISTRY: dict[str, str] = {
+    "Qwen/Qwen3-32B": "qwen/qwen3-32b",
     "Qwen/Qwen3-235B-A22B-Instruct-2507": "qwen/qwen3-235b-a22b-2507",
     "Qwen/Qwen3-Coder-480B-A35B-Instruct": "qwen/qwen3-coder",
     "deepseek-ai/DeepSeek-V3.2": "deepseek/deepseek-v3.2",

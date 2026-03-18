@@ -8,5 +8,5 @@
   "trust_remote_code": true,
   "modal_gpu": "H100:4",
   "modal_min_containers": 1,
-  "modal_scaledown_window_seconds": 600
+  "modal_scaledown_window_seconds": 60
 }

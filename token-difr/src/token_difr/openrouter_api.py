@@ -5,6 +5,7 @@ import re
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import openai
 from openai.types.chat import ChatCompletion
@@ -21,10 +22,78 @@ from token_difr.model_registry import get_openrouter_name
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model_id}/endpoints"
+OPENROUTER_PROVIDER_ALIASES: dict[str, str] = {
+    # Canonical hyphenated IDs.
+    "atlas-cloud": "atlas-cloud",
+    "google-vertex": "google-vertex",
+    # Common compact/spacing aliases observed in registry payloads.
+    "atlascloud": "atlas-cloud",
+    "google": "google-vertex",
+    "googlevertex": "google-vertex",
+}
 
 
 def _sanitize(name: str) -> str:
     return name.replace("/", "_").replace(".", "_")
+
+
+def _extract_reasoning_from_details(details: Any) -> str:
+    """Extract plain reasoning text from OpenRouter reasoning_details payloads."""
+    if not isinstance(details, list):
+        return ""
+
+    parts: list[str] = []
+    for entry in details:
+        if isinstance(entry, str):
+            parts.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        text = entry.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        if isinstance(text, dict):
+            content = text.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+                continue
+
+        content = entry.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+
+    return "".join(parts)
+
+
+def _extract_reasoning_text(message: Any) -> str:
+    """Extract reasoning text from OpenRouter message extensions."""
+    candidates = (
+        getattr(message, "reasoning", None),
+        getattr(message, "reasoning_content", None),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+
+    model_extra = getattr(message, "model_extra", None)
+    if isinstance(model_extra, dict):
+        for key in ("reasoning", "reasoning_content"):
+            value = model_extra.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        details_text = _extract_reasoning_from_details(model_extra.get("reasoning_details"))
+        if details_text:
+            return details_text
+
+    details = getattr(message, "reasoning_details", None)
+    details_text = _extract_reasoning_from_details(details)
+    if details_text:
+        return details_text
+
+    return ""
 
 
 def _fetch_registry() -> list[dict]:
@@ -72,13 +141,30 @@ def _normalize_provider_entry(entry: object) -> str | None:
     return None
 
 
+def _canonicalize_provider_base(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    if not cleaned:
+        return ""
+    compact = cleaned.replace("-", "")
+    if cleaned in OPENROUTER_PROVIDER_ALIASES:
+        return OPENROUTER_PROVIDER_ALIASES[cleaned]
+    if compact in OPENROUTER_PROVIDER_ALIASES:
+        return OPENROUTER_PROVIDER_ALIASES[compact]
+    return compact
+
+
 def _normalize_provider_slug(name: str) -> str:
     cleaned = name.strip()
     if " | " in cleaned:
         cleaned = cleaned.split(" | ", 1)[0].strip()
     if "/" in cleaned:
-        return cleaned.lower()
-    return re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+        base, suffix = cleaned.split("/", 1)
+        normalized_base = _canonicalize_provider_base(base)
+        normalized_suffix = re.sub(r"[^a-z0-9._-]+", "-", suffix.strip().lower()).strip("-")
+        if normalized_base and normalized_suffix:
+            return f"{normalized_base}/{normalized_suffix}"
+        return normalized_base or normalized_suffix
+    return _canonicalize_provider_base(cleaned)
 
 
 def _extract_variant(endpoint: dict) -> str | None:
@@ -265,9 +351,10 @@ def tokenize_openrouter_responses(
         # Extract content and reasoning from response
         message = completion.choices[0].message
         content = message.content or ""
-        # reasoning is an OpenRouter extension - check both direct attribute and model_extra
-        reasoning = getattr(message, "reasoning", None)
-        reasoning = reasoning or ""
+        reasoning = _extract_reasoning_text(message)
+        # Avoid duplicating thinking segments when content already carries them inline.
+        if reasoning and "<think>" in content and "</think>" in content:
+            reasoning = ""
 
         # Tokenize prompt
         rendered = render_conversation_for_tokenization(

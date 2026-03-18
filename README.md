@@ -33,9 +33,11 @@ Set required environment variables:
 ```bash
 export OPENROUTER_API_KEY="..."
 export FIREWORKS_API_KEY="..."                     # needed for Fireworks verification
-export MODAL_VERIFICATION_BASE_URL="https://..."   # needed for modal verification backend
+export MODAL_VERIFICATION_BASE_URL="https://..."   # optional fixed modal verification endpoint
 export MODAL_VERIFICATION_API_KEY="..."            # optional
 export MODAL_BASE_URL="https://..."                # optional for modal generation
+export TOKEN_DIFR_MODAL_AUDIT_MAX_MODEL_LEN_CAP=8192  # optional cap for auto-managed modal audits
+export TOKEN_DIFR_MODAL_VERIFICATION_CONCURRENCY=1     # optional modal verification request concurrency
 ```
 
 ## Start/stop reference servers
@@ -60,6 +62,9 @@ uv run serve.py modal stop --all
 
 Notes:
 - `serve.py modal start` deploys `token-difr/modal_vllm_app.py` by default (`--no-deploy` to reuse existing deployment).
+- During deploy, `serve.py` sets `TOKEN_DIFR_MODAL_GPU` from `--gpu` so the Modal runtime matches each model profile.
+- Modal server defaults now use `min_containers=0` so idle servers can scale to zero.
+- Default `scaledown_window_seconds` is `60` (override per model config if needed).
 - Tracked runtime state is stored in `token-difr/state/servers.json`.
 
 ## Generate reference tokens
@@ -110,6 +115,14 @@ uv run audit.py Qwen/Qwen3-8B \
   --reference-tokens \
   --verification-backend modal \
   --modal-verification-base-url "https://<modal-endpoint>"
+```
+
+Auto-managed per-model Modal verification (no fixed endpoint required):
+
+```bash
+uv run audit.py Qwen/Qwen3-8B openai/gpt-oss-120b \
+  --reference-tokens \
+  --verification-backend modal
 ```
 
 Results are written under `token-difr/audit_results/` when run from `token-difr/`.
@@ -193,9 +206,12 @@ They are intentionally simplified to current supported local vLLM + Modal fields
 - `dtype`
 - `gpu_memory_utilization`
 - `max_model_len`
+- `max_num_seqs`
+- `enforce_eager`
 - `trust_remote_code`
 - `modal_gpu`
 - `modal_min_containers`
+- `modal_max_containers`
 - `modal_scaledown_window_seconds`
 
 ## Current limitations

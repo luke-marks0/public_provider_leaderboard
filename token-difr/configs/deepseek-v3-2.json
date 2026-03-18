@@ -1,12 +1,12 @@
 {
-  "model": "Qwen/Qwen3-8B",
+  "model": "deepseek-ai/DeepSeek-V3.2",
   "served_model_name": "",
-  "tensor_parallel_size": 1,
-  "dtype": "float16",
+  "tensor_parallel_size": 8,
+  "dtype": "auto",
   "gpu_memory_utilization": 0.9,
-  "max_model_len": 40960,
-  "trust_remote_code": false,
-  "modal_gpu": "H100",
+  "max_model_len": 8192,
+  "trust_remote_code": true,
+  "modal_gpu": "H100:8",
   "modal_min_containers": 1,
-  "modal_scaledown_window_seconds": 600
+  "modal_scaledown_window_seconds": 60
 }
